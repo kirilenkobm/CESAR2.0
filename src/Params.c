@@ -21,6 +21,7 @@ bool Params__create(struct Params* self, struct EmissionTable emission_tables[6]
   self->lastexon = false;
   self->sanityChecks = false;
   self->max_memory = MEMORYLIMIT;
+  self->traceback_mode = TRACEBACK_AUTO;
 
   self->num_start_codons = 1;
   self->start_codons = (Literal*) SAFEMALLOC(sizeof(Literal) * 3 * self->num_start_codons);

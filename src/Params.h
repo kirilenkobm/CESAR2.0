@@ -19,6 +19,12 @@
 #define PATH_STRING_LENGTH 1024
 #define NUM_CS_DELETIONS 10
 
+typedef enum TracebackMode {
+  TRACEBACK_AUTO,
+  TRACEBACK_DENSE,
+  TRACEBACK_CHECKPOINT
+} TracebackMode;
+
 typedef struct Params {
   char clade[PATH_STRING_LENGTH],
     //blosum_file[PATH_STRING_LENGTH],
@@ -54,6 +60,8 @@ typedef struct Params {
   size_t split_emissions_acceptor,
           split_emissions_donor,
           max_memory;
+
+  TracebackMode traceback_mode;
 
   uint16_t num_start_codons;
   Literal* start_codons;

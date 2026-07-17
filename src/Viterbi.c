@@ -17,8 +17,74 @@
 #include "EmissionTable.h"
 #include "Transition.h"
 #include "Matrix.h"
+#include "SafeAlloc.h"
 
 #include "Viterbi.h"
+
+typedef struct ViterbiCheckpoints {
+  size_t block_size;
+  size_t num_checkpoints;
+  size_t num_states;
+  LOGODD_T* scores;
+} ViterbiCheckpoints;
+
+size_t Viterbi__checkpoint_block_size(size_t num_observations) {
+  if (num_observations == 0) {
+    return 1;
+  }
+
+  // Balance four LOGODD_T score columns per checkpoint against one packed
+  // traceback block (two path entries per byte).
+  size_t block_size = (size_t) ceil(sqrt(8.0 * sizeof(LOGODD_T) * num_observations));
+  return block_size > num_observations ? num_observations : block_size;
+}
+
+size_t Viterbi__estimate_dense_traceback_bytes(size_t num_states, size_t num_observations) {
+  return ((num_observations + 1) * num_states + 1) / 2;
+}
+
+size_t Viterbi__estimate_checkpoint_traceback_bytes(size_t num_states, size_t num_observations) {
+  if (num_states == 0 || num_observations == 0) {
+    return 0;
+  }
+
+  const size_t block_size = Viterbi__checkpoint_block_size(num_observations);
+  const size_t num_checkpoints = (num_observations - 1) / block_size + 1;
+  const size_t checkpoint_bytes = num_checkpoints * 4 * num_states * sizeof(LOGODD_T);
+  const size_t block_path_bytes = ((block_size + 1) * num_states + 1) / 2;
+  const size_t start_path_bytes = (num_states + 1) / 2;
+  return checkpoint_bytes + block_path_bytes + start_path_bytes;
+}
+
+static struct ViterbiCheckpoints* Viterbi__create_checkpoints(
+    size_t num_states, size_t num_observations) {
+  struct ViterbiCheckpoints* self = SAFEMALLOC(sizeof(struct ViterbiCheckpoints));
+  self->block_size = Viterbi__checkpoint_block_size(num_observations);
+  self->num_checkpoints = (num_observations - 1) / self->block_size + 1;
+  self->num_states = num_states;
+  self->scores = SAFEMALLOC(
+      self->num_checkpoints * 4 * self->num_states * sizeof(LOGODD_T));
+  return self;
+}
+
+static void Viterbi__destroy_checkpoints(struct ViterbiCheckpoints* self) {
+  free(self->scores);
+  free(self);
+}
+
+static void Viterbi__save_checkpoint(
+    struct ViterbiCheckpoints* self, size_t t, struct LogoddMatrix* vmatrix) {
+  size_t checkpoint = t / self->block_size;
+  memcpy(&self->scores[checkpoint * 4 * self->num_states], vmatrix->v,
+      4 * self->num_states * sizeof(LOGODD_T));
+}
+
+static void Viterbi__restore_checkpoint(
+    struct ViterbiCheckpoints* self, size_t t, struct LogoddMatrix* vmatrix) {
+  size_t checkpoint = t / self->block_size;
+  memcpy(vmatrix->v, &self->scores[checkpoint * 4 * self->num_states],
+      4 * self->num_states * sizeof(LOGODD_T));
+}
 
 /**
  * Create a new viterbi matrix and fill its values with -inf
@@ -112,7 +178,7 @@ LOGODD_T Viterbi__get_emission_logodd(Literal* observations, size_t t, struct St
  * 1.3 assign viterbi(t,k1) := pmax
  * 1.4 assign path(t-num_emissions, k1) := k0
  */
-void Viterbi__step(struct LogoddMatrix* vmatrix, struct PathMatrix* pmatrix, struct HMM* hmm, Literal* observations, size_t t) {
+void Viterbi__step(struct LogoddMatrix* vmatrix, struct PathMatrix* pmatrix, struct HMM* hmm, Literal* observations, size_t t, size_t path_t) {
   if (t != 0) {
     for(STATE_ID_T sid=0; sid < hmm->num_states; sid++) {
       LogoddMatrix__set(vmatrix, t%4, sid, LOGODD_NEGINF);
@@ -224,7 +290,9 @@ void Viterbi__step(struct LogoddMatrix* vmatrix, struct PathMatrix* pmatrix, str
         }
         LogoddMatrix__set(vmatrix, t%4, state->id, max_logodd);
         logv(6, "t=%lu\ti=%s="SID"\tassign p(%lu,%s="SID") := "SID" (incoming #%u)", t, state->name, i, t, state->name, state->id, origin_id, (unsigned) origin_index);
-        PathMatrix__set(pmatrix, t, state->id, origin_index);
+        if (pmatrix != NULL) {
+          PathMatrix__set(pmatrix, path_t, state->id, origin_index);
+        }
       }
     }
   }  // hmm->states  O( deg+(k) * S + s*s) (s = silent states in S)
@@ -233,14 +301,16 @@ void Viterbi__step(struct LogoddMatrix* vmatrix, struct PathMatrix* pmatrix, str
 /**
  * Run viterbi on an HMM.
  * The given path pointer contains the most probable path through the HMM that ends in an ending state.
- * Notice: This creates two S*T matrices in memory, where S is the number of states in the HMM and T is the number of observations.
+ * Dense mode retains the packed S*T path matrix. Checkpoint mode saves score
+ * snapshots and recomputes short path blocks on demand.
  * @param hmm the HMM.
  * @param num_observations the length of the query.
  * @param observations the array of observed literals.
  * @param path_length a maximum length of the resulting path.
  * @param path a pointer to an array for the sequence of state pointers.
  */
-void Viterbi(struct HMM* hmm, size_t num_observations, Literal* observations, size_t* path_length, struct State** path) {
+void Viterbi(struct HMM* hmm, size_t num_observations, Literal* observations,
+    size_t* path_length, struct State** path, TracebackMode traceback_mode) {
   if (num_observations == 0) {
     die("No observations.");
   }
@@ -262,7 +332,15 @@ void Viterbi(struct HMM* hmm, size_t num_observations, Literal* observations, si
 
   // The init of a dynamically sized 2d array requires >=c99
   struct LogoddMatrix* vmatrix = Viterbi__init_logodd_matrix(hmm);
-  struct PathMatrix* pmatrix = Viterbi__init_path_matrix(hmm, num_observations);
+  struct PathMatrix* dense_path = NULL;
+  struct PathMatrix* start_path = NULL;
+  struct ViterbiCheckpoints* checkpoints = NULL;
+  if (traceback_mode == TRACEBACK_DENSE) {
+    dense_path = Viterbi__init_path_matrix(hmm, num_observations);
+  } else {
+    start_path = PathMatrix__create(1, hmm->num_states, PATH_EMPTY);
+    checkpoints = Viterbi__create_checkpoints(hmm->num_states, num_observations);
+  }
 
   // init the first column: the initial states.
   for (size_t i = 0; i < hmm->num_starts; i++) {
@@ -271,7 +349,14 @@ void Viterbi(struct HMM* hmm, size_t num_observations, Literal* observations, si
   }  // O(S)
 
   for (size_t t=0; t <= num_observations; t++) {
-    Viterbi__step(vmatrix, pmatrix, hmm, observations, t);
+    struct PathMatrix* forward_path = traceback_mode == TRACEBACK_DENSE
+        ? dense_path
+        : (t == 0 ? start_path : NULL);
+    Viterbi__step(vmatrix, forward_path, hmm, observations, t, t);
+    if (traceback_mode == TRACEBACK_CHECKPOINT &&
+        t < num_observations && t % checkpoints->block_size == 0) {
+      Viterbi__save_checkpoint(checkpoints, t, vmatrix);
+    }
   }  // O(deg+(k) * S * T) = O(S * T)
 
   if (g_loglevel > 3) {
@@ -286,8 +371,6 @@ void Viterbi(struct HMM* hmm, size_t num_observations, Literal* observations, si
       fprintf(matrixlog, "###states_end\n");
       LogoddMatrix__str(vmatrix, tmp);
       fprintf(matrixlog, "###vmatrix:\n%s\n###vmatrix_end\n", tmp);
-      PathMatrix__str(pmatrix, tmp);
-      fprintf(matrixlog, "###pmatrix:\n%s\n###pmatrix_end\n", tmp);
       fclose(matrixlog);
     }
   }
@@ -310,8 +393,16 @@ void Viterbi(struct HMM* hmm, size_t num_observations, Literal* observations, si
 
   logv(1, "LogoddMatrix (WxH):\t%lu x %lu", vmatrix->num_columns, vmatrix->num_rows);
   logv(1, "LogoddMatrix (bytes):\t%lu", LogoddMatrix__bytes(vmatrix));
-  logv(1, "PathMatrix (WxH):\t%lu x %lu", pmatrix->num_columns, pmatrix->num_rows);
-  logv(1, "PathMatrix (bytes):\t%lu", PathMatrix__bytes(pmatrix));
+  if (traceback_mode == TRACEBACK_DENSE) {
+    logv(1, "Traceback mode:\tdense");
+    logv(1, "Traceback storage (bytes):\t%lu", PathMatrix__bytes(dense_path));
+  } else {
+    logv(1, "Traceback mode:\tcheckpoint");
+    logv(1, "Traceback checkpoint block size:\t%lu", checkpoints->block_size);
+    logv(1, "Traceback checkpoints:\t%lu", checkpoints->num_checkpoints);
+    logv(1, "Traceback storage (bytes):\t%lu",
+        Viterbi__estimate_checkpoint_traceback_bytes(hmm->num_states, num_observations));
+  }
   logv(1, "States (bytes):\t%lu", sizeof(State) * hmm->num_states);
 
   if (best_end == STATE_MAX_ID || logodd == LOGODD_NEGINF) {
@@ -327,21 +418,48 @@ void Viterbi(struct HMM* hmm, size_t num_observations, Literal* observations, si
   logv(4, "path[%lu] := "SID, *path_length-1, best_end);
   path[*path_length-1] = &hmm->states[best_end];
 
-  size_t i, t = num_observations;
-  for(i=*path_length-1; i > 0; i--) {
-    struct State* state = path[i];
-    // Recover the predecessor from the stored incoming-edge index. PATH_EMPTY
-    // means a start/unset cell -> self-reference (terminal), as before packing.
-    PATH_ENTRY_T incoming_index = PathMatrix__get(pmatrix, t, state->id);
-    STATE_ID_T predecessor = (incoming_index == PATH_EMPTY)
-        ? state->id
-        : state->incoming[incoming_index].origin;
-    path[i-1] = &hmm->states[predecessor];
+  size_t i = *path_length - 1;
+  size_t t = num_observations;
+  if (traceback_mode == TRACEBACK_DENSE) {
+    for (; i > 0; i--) {
+      struct State* state = path[i];
+      PATH_ENTRY_T incoming_index = PathMatrix__get(dense_path, t, state->id);
+      STATE_ID_T predecessor = (incoming_index == PATH_EMPTY)
+          ? state->id
+          : state->incoming[incoming_index].origin;
+      path[i-1] = &hmm->states[predecessor];
+      if (t == 0 && state->num_emissions > 0) {
+        break;
+      }
+      t -= state->num_emissions;
+    }
+  } else while (i > 0 && t > 0) {
+    // Always choose the checkpoint strictly before the current traceback
+    // coordinate, so the endpoint's backpointer is recomputed in this block.
+    const size_t block_start = ((t - 1) / checkpoints->block_size) * checkpoints->block_size;
+    const size_t block_columns = t - block_start + 1;
+    struct PathMatrix* block_path =
+        PathMatrix__create(block_columns, hmm->num_states, PATH_EMPTY);
 
-    if (g_loglevel >= 4) {
-      char qry[4] = "", ref[4] = "";
-      Literal__str(state->num_emissions, &observations[t-state->num_emissions], qry);
-      Literal__str(state->num_emissions, state->reference, ref);
+    Viterbi__restore_checkpoint(checkpoints, block_start, vmatrix);
+    for (size_t recompute_t = block_start + 1; recompute_t <= t; recompute_t++) {
+      Viterbi__step(vmatrix, block_path, hmm, observations, recompute_t,
+          recompute_t - block_start);
+    }
+
+    while (i > 0 && t > block_start) {
+      struct State* state = path[i];
+      PATH_ENTRY_T incoming_index =
+          PathMatrix__get(block_path, t - block_start, state->id);
+      STATE_ID_T predecessor = (incoming_index == PATH_EMPTY)
+          ? state->id
+          : state->incoming[incoming_index].origin;
+      path[i-1] = &hmm->states[predecessor];
+
+      if (g_loglevel >= 4) {
+        char qry[4] = "", ref[4] = "";
+        Literal__str(state->num_emissions, &observations[t-state->num_emissions], qry);
+        Literal__str(state->num_emissions, state->reference, ref);
       /*
       uint16_t qry_id = Literal__uint(state->num_emissions, &observations[t-state->num_emissions]);
       uint16_t ref_id = Literal__uint(state->num_emissions, state->reference);
@@ -353,13 +471,26 @@ void Viterbi(struct HMM* hmm, size_t num_observations, Literal* observations, si
           qry, qry_id, ref, ref_id, Viterbi__get_emission_logodd(observations, t, state),
           LogoddMatrix__get(vmatrix, t, state->id));
       */
-    }
+      }
 
-    if (t == 0 && state->num_emissions > 0) {
+      t -= state->num_emissions;
+      i--;
+    }
+    PathMatrix__destroy(block_path);
+  }
+
+  while (traceback_mode == TRACEBACK_CHECKPOINT && i > 0) {
+    struct State* state = path[i];
+    PATH_ENTRY_T incoming_index = PathMatrix__get(start_path, 0, state->id);
+    STATE_ID_T predecessor = (incoming_index == PATH_EMPTY)
+        ? state->id
+        : state->incoming[incoming_index].origin;
+    path[i-1] = &hmm->states[predecessor];
+    if (state->num_emissions > 0) {
       break;
     }
-    t -= state->num_emissions;
-  }  // O(T)
+    i--;
+  }
 
   // shrink path
   const size_t offset = i;
@@ -373,5 +504,10 @@ void Viterbi(struct HMM* hmm, size_t num_observations, Literal* observations, si
   *path_length -= offset;
 
   LogoddMatrix__destroy(vmatrix);
-  PathMatrix__destroy(pmatrix);
+  if (traceback_mode == TRACEBACK_DENSE) {
+    PathMatrix__destroy(dense_path);
+  } else {
+    PathMatrix__destroy(start_path);
+    Viterbi__destroy_checkpoints(checkpoints);
+  }
 }

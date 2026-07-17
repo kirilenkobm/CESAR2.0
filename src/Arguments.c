@@ -42,6 +42,7 @@ void print_help() {
          "             -f/--firstexon\n"
          "             -l/--lastexon\n"
          "             -x/--max-memory\n"
+         "             --traceback-mode <auto|dense|checkpoint>\n"
          "             -v/--verbosity <0 .. 2>\n"
          "             -V/--version\n"
          "             -s/--set name1=value1 .. nameN=valueN\n"
@@ -80,6 +81,20 @@ bool Arguments__read(int argc, char** argv, struct Params* parameters) {
       Params__set_via_str(parameters, "split_emissions_donor", argv[++i]);
     } else if (!strcmp(argument, "-x") || !strcmp(argument, "--max-memory")) {
       Params__set_via_str(parameters, "max_memory", argv[++i]);
+    } else if (!strcmp(argument, "--traceback-mode")) {
+      if (i + 1 >= argc) {
+        die("Missing value for --traceback-mode; expected auto, dense, or checkpoint.");
+      }
+      char* mode = argv[++i];
+      if (!strcmp(mode, "auto")) {
+        parameters->traceback_mode = TRACEBACK_AUTO;
+      } else if (!strcmp(mode, "dense")) {
+        parameters->traceback_mode = TRACEBACK_DENSE;
+      } else if (!strcmp(mode, "checkpoint")) {
+        parameters->traceback_mode = TRACEBACK_CHECKPOINT;
+      } else {
+        die("Unknown traceback mode '%s'; expected auto, dense, or checkpoint.", mode);
+      }
     } else if (!strcmp(argument, "-c") || !strcmp(argument, "--clade")) {
       Params__set_via_str(parameters, "clade", argv[++i]);
     } else if (!strcmp(argument, "-m")  || !strcmp(argument, "--matrix")) {

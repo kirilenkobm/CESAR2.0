@@ -73,7 +73,7 @@ void TestViterbi__validate_simple_path(void) {
   struct State* path[3];
   Literal observations[3] = { LITERAL_A, LITERAL_A, LITERAL_A };
 
-  Viterbi(TestViterbi__hmm, 3, observations, &path_length, path);
+  Viterbi(TestViterbi__hmm, 3, observations, &path_length, path, TRACEBACK_DENSE);
 
   for (size_t i=0; i < 3; i++) {
     struct State* state = path[i];

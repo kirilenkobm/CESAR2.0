@@ -4,6 +4,7 @@
  */
 
 #include <stdio.h>
+#include <stdint.h>
 #include <string.h>
 #include <time.h>
 #include <unistd.h>
@@ -22,6 +23,8 @@
 
 
 char g_loglevel = LOGLEVEL;
+
+#define AUTO_CHECKPOINT_BYTES UINT64_C(64000000000)
 
 /**
  * The main program.
@@ -177,21 +180,43 @@ int main(int argc, char* argv[argc]) {
     }
   }
 
-  double mem = 
+  const size_t common_mem =
      (num_states * 4 * sizeof(double))                     +   /* Viterbi logodds vmatrix, double has typically 8 bytes */
-     ((num_states * (qlength_max + 1) + 1) / 2)            +   /* Viterbi path matrix, two 4-bit entries per byte */
      (num_states * sizeof(State))                          +   /* Space for all the state structures, each 304 bytes for a struct State */
 	  ((2 * qlength_max + rlength) * sizeof(struct State*)) +   /* Space for Viterbi path, 8 bytes for a pointer on a 64 bit system */
 	  ((qlength_max + rlength) * 2 * sizeof(char))          +   /* Space for the aligned seqs */
 	  ((qlength_max + rlength) * 1)                         +   /* Space to store all the sequences */
 	  3000000;                                                  /* need some smaller emission tables (32 k) and other small stuff. 
                                                                        Tests have shown that we may underestimate the real memory by up to 2 Mb. Therefore, be conservative. */
-  mem = mem/1000000000;  /* in GB */	  
-  logv(1, "Expecting a memory consumption of: %f GB (max_memory %f)", mem, (double)parameters.max_memory);
-  if (mem > (double)parameters.max_memory) {
-    die("The memory consumption is limited to %1.4f GB by default. Your attempt requires %1.4f GB. You can change the limit via --max-memory.", (double)parameters.max_memory, mem);
+
+  const size_t dense_mem = common_mem +
+      Viterbi__estimate_dense_traceback_bytes(num_states, qlength_max);
+  const size_t checkpoint_mem = common_mem +
+      Viterbi__estimate_checkpoint_traceback_bytes(num_states, qlength_max);
+  const size_t max_memory_bytes = parameters.max_memory * UINT64_C(1000000000);
+
+  TracebackMode traceback_mode = parameters.traceback_mode;
+  if (traceback_mode == TRACEBACK_AUTO) {
+    // Prefer the faster dense path when it fits comfortably. Switch only when
+    // checkpointing saves memory; for a huge HMM and very short query, its
+    // score snapshots can be larger than the already-small dense path matrix.
+    traceback_mode = dense_mem <= max_memory_bytes &&
+        (dense_mem <= AUTO_CHECKPOINT_BYTES || checkpoint_mem >= dense_mem)
+        ? TRACEBACK_DENSE
+        : TRACEBACK_CHECKPOINT;
+  }
+
+  const size_t selected_mem = traceback_mode == TRACEBACK_DENSE ? dense_mem : checkpoint_mem;
+  const char* traceback_mode_name =
+      traceback_mode == TRACEBACK_DENSE ? "dense" : "checkpoint";
+  logv(1, "Dense traceback estimate: %1.4f GB", dense_mem / 1000000000.0);
+  logv(1, "Checkpoint traceback estimate: %1.4f GB", checkpoint_mem / 1000000000.0);
+  logv(1, "Selected traceback mode: %s", traceback_mode_name);
+  if (selected_mem > max_memory_bytes) {
+    die("The memory consumption is limited to %1.4f GB. Traceback mode '%s' requires approximately %1.4f GB. You can change the mode via --traceback-mode or the limit via --max-memory.",
+        (double) parameters.max_memory, traceback_mode_name, selected_mem / 1000000000.0);
   } else {
-    logv(1, "Expecting a memory consumption of: %1.4f GB", mem);
+    logv(1, "Expecting a memory consumption of: %1.4f GB", selected_mem / 1000000000.0);
   }
 
 
@@ -233,7 +258,8 @@ int main(int argc, char* argv[argc]) {
     size_t path_length = 0;
 
     time = clock();
-    Viterbi(hmm, fasta.queries[q]->length, fasta.queries[q]->sequence, &path_length, path);
+    Viterbi(hmm, fasta.queries[q]->length, fasta.queries[q]->sequence,
+        &path_length, path, traceback_mode);
     logv(1, "Viterbi (sec):\t%f", (float)(clock() - time) / CLOCKS_PER_SEC);
 
     struct Alignment* alignment = Alignment__create(&fasta, q, &parameters, path_length, path);
